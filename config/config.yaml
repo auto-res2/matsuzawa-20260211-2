@@ -1,6 +1,7 @@
 # Hydra configuration for CISC experiment
 defaults:
   - _self_
+  - run: ???
 
 # WandB settings
 wandb:
@@ -28,8 +29,3 @@ results_dir: results
 
 # Execution mode (main, sanity_check, pilot)
 mode: main
-
-# Run configuration (loaded from config/runs/*.yaml)
-run:
-  run_id: ???
-  method: ???
