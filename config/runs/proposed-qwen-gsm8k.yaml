@@ -1,5 +1,5 @@
 # Proposed method: CISC (Counterfactual Invariance Self-Consistency)
-# Model: Qwen/Qwen2.5-Coder-3B-Instruct
+# Model: Qwen/Qwen2.5-Math-7B-Instruct
 # Dataset: openai/gsm8k
 
 run_id: proposed-qwen-gsm8k
@@ -10,7 +10,7 @@ method:
   description: "Counterfactual Invariance Self-Consistency - selection method that evaluates candidate answers for invariance under semantics-preserving paraphrases"
 
 model:
-  name: Qwen/Qwen2.5-Coder-3B-Instruct
+  name: Qwen/Qwen2.5-Math-7B-Instruct
 
 dataset:
   name: openai/gsm8k

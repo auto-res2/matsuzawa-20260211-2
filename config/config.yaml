@@ -1,7 +1,6 @@
 # Hydra configuration for CISC experiment
 defaults:
   - _self_
-  - run: ???
 
 # WandB settings
 wandb:
@@ -11,7 +10,7 @@ wandb:
 
 # Model settings
 model:
-  name: Qwen/Qwen2.5-Coder-3B-Instruct
+  name: Qwen/Qwen2.5-Math-7B-Instruct
   cache_dir: .cache
   device: auto
   dtype: auto  # bf16 on GPU, fp32 on CPU

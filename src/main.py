@@ -209,6 +209,36 @@ def main(cfg: DictConfig) -> None:
     Args:
         cfg: Hydra config
     """
+    # Manually load run config from runs/ directory if needed
+    # Hydra expects config/run/ but files are in config/runs/
+    if "run" not in cfg or cfg.run is None:
+        # Parse run= from command line
+        run_id = None
+        for arg in sys.argv[1:]:
+            if arg.startswith('run='):
+                run_id = arg.split('=', 1)[1]
+                break
+        
+        if run_id:
+            # Load run config manually
+            config_dir = Path(__file__).parent.parent / "config"
+            run_config_path = config_dir / "runs" / f"{run_id}.yaml"
+            
+            if run_config_path.exists():
+                import yaml
+                with open(run_config_path, 'r') as f:
+                    run_config = yaml.safe_load(f)
+                
+                # Merge run config into cfg
+                cfg.run = OmegaConf.create(run_config)
+                print(f"Loaded run config from: {run_config_path}")
+            else:
+                print(f"Error: Run config not found: {run_config_path}")
+                sys.exit(1)
+        else:
+            print("Error: run=<run_id> must be specified")
+            sys.exit(1)
+    
     # Apply mode overrides
     cfg = apply_mode_overrides(cfg)
     

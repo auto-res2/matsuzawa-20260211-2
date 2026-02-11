@@ -1,5 +1,5 @@
 # Comparative method 0: Self-Consistency (SC) majority vote
-# Model: Qwen/Qwen2.5-Coder-3B-Instruct
+# Model: Qwen/Qwen2.5-Math-7B-Instruct
 # Dataset: openai/gsm8k
 
 run_id: comparative-0-qwen-gsm8k
@@ -10,7 +10,7 @@ method:
   description: "Standard self-consistency baseline: sample k CoT solutions and choose the most frequent answer via majority vote"
 
 model:
-  name: Qwen/Qwen2.5-Coder-3B-Instruct
+  name: Qwen/Qwen2.5-Math-7B-Instruct
 
 dataset:
   name: openai/gsm8k
