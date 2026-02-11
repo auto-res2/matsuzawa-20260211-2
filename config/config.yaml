@@ -1,0 +1,35 @@
+# Hydra configuration for CISC experiment
+defaults:
+  - _self_
+
+# WandB settings
+wandb:
+  entity: airas
+  project: 2026-02-11
+  mode: online  # overridden to disabled in sanity_check mode
+
+# Model settings
+model:
+  name: Qwen/Qwen2.5-Coder-3B-Instruct
+  cache_dir: .cache
+  device: auto
+  dtype: auto  # bf16 on GPU, fp32 on CPU
+
+# Dataset settings
+dataset:
+  name: openai/gsm8k
+  subset: main
+  split: test
+  cache_dir: .cache
+  n_samples: 200  # overridden in sanity_check mode
+
+# Results directory
+results_dir: results
+
+# Execution mode (main, sanity_check, pilot)
+mode: main
+
+# Run configuration (loaded from config/runs/*.yaml)
+run:
+  run_id: ???
+  method: ???

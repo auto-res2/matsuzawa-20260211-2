@@ -1,0 +1,69 @@
+# Proposed method: CISC (Counterfactual Invariance Self-Consistency)
+# Model: Qwen/Qwen2.5-Coder-3B-Instruct
+# Dataset: openai/gsm8k
+
+run_id: proposed-qwen-gsm8k
+
+method:
+  name: cisc
+  type: proposed
+  description: "Counterfactual Invariance Self-Consistency - selection method that evaluates candidate answers for invariance under semantics-preserving paraphrases"
+
+model:
+  name: Qwen/Qwen2.5-Coder-3B-Instruct
+
+dataset:
+  name: openai/gsm8k
+  subset: main
+  split: test
+
+inference:
+  # Proposal stage
+  k: 6  # number of CoT samples
+  temp_cot: 0.7
+  max_new_tokens_cot: 256
+  
+  # Paraphrase stage
+  t_paraphrase: 3  # number of paraphrases per unique answer
+  temp_paraphrase: 0.8
+  max_new_tokens_paraphrase: 160
+  
+  # Re-solve stage
+  temp_solve: 0.2
+  max_new_tokens_solve: 160
+  
+  # Scoring parameters
+  alpha: 1.0  # blind judge weight exponent
+  eps: 0.2  # invariance floor
+  
+  # CoT trigger
+  cot_trigger: "Let's think step by step"
+
+# Optional: hyperparameter search
+optuna:
+  enabled: false
+  n_trials: 20
+  sampler: TPESampler
+  search_spaces:
+    - param_name: k
+      distribution_type: categorical
+      choices: [4, 6, 8]
+    - param_name: t_paraphrase
+      distribution_type: categorical
+      choices: [2, 3, 4]
+    - param_name: alpha
+      distribution_type: uniform
+      low: 0.5
+      high: 2.0
+    - param_name: eps
+      distribution_type: uniform
+      low: 0.0
+      high: 0.5
+    - param_name: temp_cot
+      distribution_type: uniform
+      low: 0.5
+      high: 0.9
+    - param_name: temp_solve
+      distribution_type: uniform
+      low: 0.0
+      high: 0.3
