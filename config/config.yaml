@@ -28,3 +28,6 @@ results_dir: results
 
 # Execution mode (main, sanity_check, pilot)
 mode: main
+
+# Run configuration (will be populated from runs/ directory)
+run: {}

@@ -201,6 +201,27 @@ def sanity_validate(cfg: DictConfig, results: Dict[str, Any]) -> bool:
     return True
 
 
+def _preprocess_args():
+    """
+    Pre-process command-line arguments for Hydra compatibility.
+    Transforms run=<run_id> into a format Hydra can handle.
+    """
+    # Find run= argument and remove it, we'll handle it manually
+    new_argv = []
+    run_id = None
+    
+    for arg in sys.argv[1:]:
+        if arg.startswith('run='):
+            run_id = arg.split('=', 1)[1]
+            # Don't pass this to Hydra
+            continue
+        new_argv.append(arg)
+    
+    # Replace sys.argv
+    sys.argv = [sys.argv[0]] + new_argv
+    return run_id
+
+
 @hydra.main(version_base=None, config_path="../config", config_name="config")
 def main(cfg: DictConfig) -> None:
     """
@@ -209,17 +230,12 @@ def main(cfg: DictConfig) -> None:
     Args:
         cfg: Hydra config
     """
-    # Manually load run config from runs/ directory if needed
-    # Hydra expects config/run/ but files are in config/runs/
-    if "run" not in cfg or cfg.run is None:
-        # Parse run= from command line
-        run_id = None
-        for arg in sys.argv[1:]:
-            if arg.startswith('run='):
-                run_id = arg.split('=', 1)[1]
-                break
-        
-        if run_id:
+    # Get run_id from global context (set by _preprocess_args)
+    run_id = getattr(main, '_run_id', None)
+    
+    # Manually load run config from runs/ directory
+    if run_id:
+        if not cfg.run or not cfg.run.get("run_id"):
             # Load run config manually
             config_dir = Path(__file__).parent.parent / "config"
             run_config_path = config_dir / "runs" / f"{run_id}.yaml"
@@ -235,9 +251,9 @@ def main(cfg: DictConfig) -> None:
             else:
                 print(f"Error: Run config not found: {run_config_path}")
                 sys.exit(1)
-        else:
-            print("Error: run=<run_id> must be specified")
-            sys.exit(1)
+    elif not cfg.run or not cfg.run.get("run_id"):
+        print("Error: run=<run_id> must be specified")
+        sys.exit(1)
     
     # Apply mode overrides
     cfg = apply_mode_overrides(cfg)
@@ -299,4 +315,8 @@ def main(cfg: DictConfig) -> None:
 
 
 if __name__ == "__main__":
+    # Pre-process command-line arguments
+    run_id = _preprocess_args()
+    # Store in function attribute for access in main
+    main._run_id = run_id
     main()
