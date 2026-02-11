@@ -594,5 +594,119 @@
     "experimental_code": "import re\nimport torch\nfrom collections import defaultdict\nfrom datasets import load_dataset\nfrom transformers import AutoTokenizer, AutoModelForCausalLM\n\n# -----------------\n# Config\n# -----------------\nMODEL_NAME = \"TinyLlama/TinyLlama-1.1B-Chat-v1.0\"\nDEVICE = \"cuda\" if torch.cuda.is_available() else \"cpu\"\nDTYPE = torch.float16 if DEVICE == \"cuda\" else torch.float32\n\nK = 6                 # CoT samples\nT_PARAPHRASE = 3      # paraphrases per unique answer\nTEMP_COT = 0.7\nTEMP_PAR = 0.8\nTEMP_SOLVE = 0.2\nMAX_NEW_TOKENS_COT = 256\nMAX_NEW_TOKENS_PAR = 160\nMAX_NEW_TOKENS_SOLVE = 160\n\nN_EVAL = 200\nALPHA = 1.0\nEPS = 0.2\n\nFINAL_RE = re.compile(r\"Final answer\\s*:\\s*(-?\\d+(?:\\.\\d+)?)\", re.IGNORECASE)\nNUM_RE = re.compile(r\"-?\\d+(?:\\.\\d+)?\")\n\n\ndef extract_final_number(text: str):\n    m = FINAL_RE.search(text)\n    if m:\n        return m.group(1)\n    nums = NUM_RE.findall(text)\n    return nums[-1] if nums else None\n\n\ndef _first_token_ids(tok, s: str):\n    ids = []\n    for variant in [s, \" \" + s]:\n        enc = tok.encode(variant, add_special_tokens=False)\n        if enc:\n            ids.append(enc[0])\n    return list(dict.fromkeys(ids))\n\n\n@torch.no_grad()\ndef generate_text(model, tok, prompt: str, temperature: float, max_new_tokens: int):\n    inputs = tok(prompt, return_tensors=\"pt\").to(model.device)\n    out = model.generate(\n        **inputs,\n        do_sample=True,\n        temperature=temperature,\n        max_new_tokens=max_new_tokens,\n        pad_token_id=tok.eos_token_id,\n    )\n    full = tok.decode(out[0], skip_special_tokens=True)\n    return full[len(prompt):]\n\n\n@torch.no_grad()\ndef sample_cot_answers(model, tok, question: str, k: int, trigger: str = \"Let's think step by step\"):\n    prompt = (\n        \"You are a careful reasoner. Solve step by step, then end with 'Final answer: <number>'.\\n\"\n        f\"Q: {question}\\nA: {trigger}.\\n\"\n    )\n    samples = []\n    for _ in range(k):\n        completion = generate_text(model, tok, prompt, TEMP_COT, MAX_NEW_TOKENS_COT)\n        ans = extract_final_number(completion)\n        samples.append((completion, ans))\n    return samples\n\n\n@torch.no_grad()\ndef p_yes_blind(model, tok, question: str, ans: str):\n    prompt = (\n        \"You are verifying an answer. Reply with exactly one word: Yes or No.\\n\"\n        f\"Q: {question}\\n\"\n        f\"Proposed final answer: {ans}\\n\"\n        \"Is the proposed final answer correct?\"\n    )\n    inputs = tok(prompt, return_tensors=\"pt\").to(model.device)\n    logits = model(**inputs).logits[0, -1]\n\n    yes_ids = _first_token_ids(tok, \"Yes\")\n    no_ids = _first_token_ids(tok, \"No\")\n    cand = yes_ids + no_ids\n    probs = torch.softmax(logits[cand], dim=-1)\n    yes_mass = sum(probs[i].item() for i in range(len(yes_ids)))\n    no_mass = sum(probs[i].item() for i in range(len(yes_ids), len(cand)))\n    return float(yes_mass / (yes_mass + no_mass + 1e-12))\n\n\n@torch.no_grad()\ndef paraphrase_question(model, tok, question: str):\n    prompt = (\n        \"Rewrite the following math word problem using different wording and sentence order, \"\n        \"but keep the exact same meaning, quantities, and constraints. Do NOT solve it. \"\n        \"Output ONLY the rewritten question.\\n\"\n        f\"Original question: {question}\\n\"\n        \"Rewritten question:\"\n    )\n    text = generate_text(model, tok, prompt, TEMP_PAR, MAX_NEW_TOKENS_PAR)\n    # Keep only first line-ish to avoid the model adding commentary\n    return text.strip().split(\"\\n\")[0].strip()\n\n\n@torch.no_grad()\ndef solve_answer_only(model, tok, question: str):\n    prompt = (\n        \"Solve the problem. Be concise. End with exactly: 'Final answer: <number>'.\\n\"\n        f\"Q: {question}\\nA:\"\n    )\n    completion = generate_text(model, tok, prompt, TEMP_SOLVE, MAX_NEW_TOKENS_SOLVE)\n    return extract_final_number(completion)\n\n\ndef majority_vote(answers):\n    counts = defaultdict(int)\n    for a in answers:\n        if a is not None:\n            counts[a] += 1\n    return max(counts.items(), key=lambda x: x[1])[0] if counts else None\n\n\n@torch.no_grad()\ndef bde_sc_select(model, tok, question: str, samples, eta_floor: float = 0.2):\n    # Baseline: blind judge + single independent re-solve agreement (similar to prior hypothesis)\n    scores = defaultdict(float)\n    for _, ans in samples:\n        if ans is None:\n            continue\n        py = p_yes_blind(model, tok, question, ans)\n        b = solve_answer_only(model, tok, question)\n        agree = (b is not None) and (b == ans)\n        w = py * (eta_floor + (1.0 - eta_floor) * float(agree))\n        scores[ans] += w\n    return max(scores.items(), key=lambda x: x[1])[0] if scores else None\n\n\n@torch.no_grad()\ndef cisc_select(model, tok, question: str, samples):\n    # Build unique answers and counts\n    counts = defaultdict(int)\n    for _, a in samples:\n        if a is not None:\n            counts[a] += 1\n\n    if not counts:\n        return None\n\n    # Cache paraphrases per question (shared across candidates)\n    paraphrases = [paraphrase_question(model, tok, question) for _ in range(T_PARAPHRASE)]\n\n    # Solve each paraphrase once (shared), then compute invariance per candidate\n    par_solutions = [solve_answer_only(model, tok, pq) for pq in paraphrases]\n\n    scores = {}\n    for a, c in counts.items():\n        py = p_yes_blind(model, tok, question, a)\n        s = sum(int(sa == a) for sa in par_solutions if sa is not None) / max(1, len(par_solutions))\n        score = (torch.log(torch.tensor(1.0 + c)).item()) * (py ** ALPHA) * (EPS + (1.0 - EPS) * s)\n        scores[a] = score\n\n    return max(scores.items(), key=lambda x: x[1])[0]\n\n\nif __name__ == \"__main__\":\n    ds = load_dataset(\"gsm8k\", \"main\")\n    test = ds[\"test\"].select(range(N_EVAL))\n\n    tok = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)\n    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=DTYPE).to(DEVICE)\n    model.eval()\n\n    correct_sc = correct_bde = correct_cisc = 0\n\n    for ex in test:\n        q = ex[\"question\"]\n        gt = extract_final_number(ex[\"answer\"])  # GSM8K gold is last number in answer field\n\n        samples = sample_cot_answers(model, tok, q, K)\n        ans_list = [a for _, a in samples]\n\n        sc_ans = majority_vote(ans_list)\n        bde_ans = bde_sc_select(model, tok, q, samples)\n        cisc_ans = cisc_select(model, tok, q, samples)\n\n        correct_sc += int(sc_ans == gt)\n        correct_bde += int(bde_ans == gt)\n        correct_cisc += int(cisc_ans == gt)\n\n    print({\n        \"self_consistency_accuracy\": correct_sc / N_EVAL,\n        \"bde_sc_accuracy\": correct_bde / N_EVAL,\n        \"cisc_accuracy\": correct_cisc / N_EVAL,\n        \"n_eval\": N_EVAL,\n        \"k\": K,\n        \"t_paraphrase\": T_PARAPHRASE,\n    })\n",
     "expected_result": "On GSM8K (first 200 test examples), k=6, t=3 paraphrases:\n- Self-consistency (majority): **accuracy ≈ 0.20–0.27** (TinyLlama-1.1B)\n- BDE-SC (blind + single re-solve): **accuracy ≈ 0.26–0.35**\n- **CISC (proposed): accuracy ≈ 0.29–0.38**\n\nConcrete point prediction (TinyLlama-1.1B, N=200):\n- self_consistency_accuracy ≈ 0.24\n- bde_sc_accuracy ≈ 0.32\n- cisc_accuracy ≈ 0.35\n\nWith a stronger 7B instruct model (same k,t):\n- self_consistency_accuracy ≈ 0.45\n- bde_sc_accuracy ≈ 0.54\n- cisc_accuracy ≈ 0.57\n\nSecondary expectations:\n- Lower sensitivity to CoT trigger phrasing: across 3 triggers, CISC should reduce std of accuracy by ~15–30% relative to SC.\n- Cases with spurious majority answers should be corrected more often when paraphrase solutions disagree with that majority (low invariance score). Higher accuracy is better.",
     "expected_conclusion": "CISC strengthens prompt-only Chain-of-Thought by introducing a *new, human-like reliability principle* at decoding time: **counterfactual invariance under restatement**. Academically, it reframes selection among CoT samples as a robustness problem in *question space*, not just a vote over rationales, and provides a testable mechanism for reducing generator–checker correlation without extra models, finetuning, or tools. Socially, it directly targets a key real-world failure mode—answers that depend on superficial phrasing—improving reliability for educational and assistive settings where users may rephrase questions and expect consistent outcomes. The hypothesis is more novel and significant than the prior BDE-SC because it operationalizes robustness-to-phrasing as an internal selection signal, yielding both accuracy gains and improved stability under natural language variation, all verifiable with a simple Python script."
+  },
+  "experimental_design": {
+    "experiment_summary": "Task: solve grade-school math word problems by generating a numeric final answer.\n\nGoal: demonstrate that Counterfactual Invariance Self-Consistency (CISC) improves prompt-only Chain-of-Thought (CoT) selection reliability compared to standard self-consistency, by selecting answers that remain stable when the same problem is restated (semantics-preserving paraphrases).\n\nWorkflow (single base model, inference-only):\n1) Propose: sample k diverse CoT solutions for each question to produce candidate numeric answers {a_i}.\n2) Aggregate candidates: group identical numeric answers and count occurrences count(a).\n3) Blind plausibility judge: for each unique candidate a, compute p(a)=P(Yes|Q,a) from the model’s next-token distribution under a rationale-occluded Yes/No prompt.\n4) Counterfactual invariance: generate t paraphrases of Q that preserve quantities/relations but change surface form; re-solve each paraphrase independently at low temperature to get answers {\\tilde a_j}. Compute invariance score s(a)=mean_j[\\tilde a_j==a].\n5) Select: Score(a)=log(1+count(a)) * (p(a))^alpha * (eps+(1-eps)*s(a)). Output argmax_a Score(a).\n\nComparison: standard self-consistency (SC) majority vote over the k sampled answers.\n\nScale/compute fit for the provided Runner (single NVIDIA H200 140GB):\n- Use one 8B-class model in bf16 on GPU.\n- Evaluate a capped subset: first N=200 examples of GSM8K test.\n- Sampling parameters chosen to keep total forward passes bounded: k=6 proposals and t=3 paraphrases (with one re-solve per paraphrase shared across candidates).\n- Optional prompt-robustness analysis uses 3 fixed CoT triggers on the same N=200 subset (no extra datasets).\nThis fits comfortably within H200 memory and runtime while still large enough (200) for statistically meaningful accuracy differences and paired significance tests.",
+    "runner_config": {
+      "runner_label": [
+        "self-hosted",
+        "gpu-runner"
+      ],
+      "description": "NVIDIA H200, VRAM: 140 GB, RAM: 240 GB"
+    },
+    "evaluation_metrics": [
+      {
+        "name": "accuracy",
+        "description": "Correctness criteria: A prediction is correct if its extracted final numeric value matches the gold numeric answer for the problem. For GSM8K, extract the gold number from the dataset’s answer field (last number in the official solution string). For the model output, extract the number following the pattern `Final answer: <number>`; if missing, fall back to the last parsable number in the output. Normalize by: stripping commas, converting to Decimal (or float if Decimal parsing fails), and comparing exact equality after normalization. (Optional safety: if both parse as floats, allow absolute tolerance 1e-9 to avoid formatting artifacts like 1 vs 1.0).\n\nCalculation method: accuracy = (1/N) * sum_{i=1..N} 1[pred_i == gold_i]. Report as a proportion in [0,1].\n\nTask appropriateness: GSM8K is a single-answer numerical reasoning task; end-to-end success is captured by final-answer correctness.\n\nRelevant visualizations: (i) bar chart of accuracy by method; (ii) paired per-item correctness heatmap (SC vs CISC) or a 2x2 contingency table plot; (iii) bootstrap confidence interval plot for accuracy."
+      },
+      {
+        "name": "prompt_robustness_std",
+        "description": "Correctness criteria: same as `accuracy`, but evaluated under multiple fixed CoT trigger phrasings.\n\nCalculation method: Choose M=3 CoT triggers (e.g., \"Let's think step by step.\", \"Think carefully and compute.\", \"Solve systematically.\"). For each method, compute accuracy_m on each trigger. Then prompt_robustness_std = std({accuracy_m}_{m=1..M}). Lower is better (more stable to small prompt changes).\n\nTask appropriateness: The hypothesis concerns selection under distributional fragility and sensitivity to surface form; variability across simple prompt phrasings measures brittleness.\n\nRelevant visualizations: line/point plot of accuracy per trigger per method with error bars; violin/box plot of the distribution of accuracies across triggers."
+      },
+      {
+        "name": "forward_passes_per_item",
+        "description": "Correctness criteria: not a correctness metric; measures compute overhead.\n\nCalculation method: Count the number of model forward/generate calls per problem instance, averaged over N.\n- SC: k proposal generations.\n- CISC: k proposal generations + U blind-judge forward passes (U = #unique candidate answers) + t paraphrase generations + t re-solve generations.\nReport mean forward passes per item and optionally wall-clock seconds per item.\n\nTask appropriateness: CISC trades extra inference for reliability; compute accounting is necessary to contextualize gains.\n\nRelevant visualizations: stacked bar chart of average forward passes broken down by component (propose/judge/paraphrase/resolve)."
+      },
+      {
+        "name": "invariance_correctness_auc",
+        "description": "Correctness criteria: Treat each unique candidate answer a as an item with label y(a)=1 if a equals the gold answer for that question, else 0. Use invariance score s(a) from CISC as a scalar confidence signal.\n\nCalculation method: For each question, compute ROC-AUC of s(a) predicting y(a) over that question’s candidate set; then average AUC across questions (macro average), skipping questions with all y(a) identical (no positives or no negatives).\n\nTask appropriateness: Directly tests the mechanism claim: invariance under paraphrased question encodings should correlate with correctness and help separate correct from brittle wrong answers.\n\nRelevant visualizations: reliability diagram / calibration plot of binned s(a) vs empirical correctness; histogram of s(a) for correct vs incorrect candidates; ROC curves (micro-averaged across pooled candidates)."
+      }
+    ],
+    "models_to_use": [
+      "Qwen/Qwen3-8B (8B)"
+    ],
+    "datasets_to_use": [
+      "openai/gsm8k (main; test split, first 200 examples)"
+    ],
+    "proposed_method": {
+      "method_name": "CISC (Counterfactual Invariance Self-Consistency)",
+      "description": "Inference-only selection method for prompt-only CoT that reduces generator–checker correlation by evaluating candidate answers for invariance under semantics-preserving paraphrases of the question. It combines (i) diversity support from self-consistency counts, (ii) a rationale-occluded blind Yes/No plausibility probability from next-token logits, and (iii) an invariance score computed by re-solving multiple paraphrases at low temperature.",
+      "optuna_config": {
+        "enabled": false,
+        "n_trials": 20,
+        "search_spaces": [
+          {
+            "param_name": "k",
+            "distribution_type": "categorical",
+            "choices": [
+              4,
+              6,
+              8
+            ]
+          },
+          {
+            "param_name": "t_paraphrase",
+            "distribution_type": "categorical",
+            "choices": [
+              2,
+              3,
+              4
+            ]
+          },
+          {
+            "param_name": "alpha",
+            "distribution_type": "uniform",
+            "low": 0.5,
+            "high": 2.0
+          },
+          {
+            "param_name": "eps",
+            "distribution_type": "uniform",
+            "low": 0.0,
+            "high": 0.5
+          },
+          {
+            "param_name": "temp_cot",
+            "distribution_type": "uniform",
+            "low": 0.5,
+            "high": 0.9
+          },
+          {
+            "param_name": "temp_solve",
+            "distribution_type": "uniform",
+            "low": 0.0,
+            "high": 0.3
+          }
+        ]
+      }
+    },
+    "comparative_methods": [
+      {
+        "method_name": "Self-Consistency (SC) majority vote",
+        "description": "Standard prompt-only self-consistency baseline: sample k chain-of-thought solutions at moderate temperature and choose the most frequent final numeric answer (majority vote).",
+        "optuna_config": {
+          "enabled": false,
+          "n_trials": 20,
+          "search_spaces": [
+            {
+              "param_name": "k",
+              "distribution_type": "categorical",
+              "choices": [
+                4,
+                6,
+                8,
+                10
+              ]
+            },
+            {
+              "param_name": "temp_cot",
+              "distribution_type": "uniform",
+              "low": 0.5,
+              "high": 0.9
+            }
+          ]
+        }
+      }
+    ]
   }
 }
